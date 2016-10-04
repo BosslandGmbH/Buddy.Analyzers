@@ -80,7 +80,9 @@ namespace Buddy.Analyzers
                                                   }
                                                   catch (Exception ex)
                                                   {
-                                                      throw new Exception(ex.ToString().Replace(Environment.NewLine, "  "));
+                                                      throw new Exception(
+                                                                ex.ToString()
+                                                                  .Replace(Environment.NewLine, "  "));
                                                   }
                                               });
         }
@@ -322,7 +324,8 @@ namespace Buddy.Analyzers
                 "System.Func"
             };
 
-            foreach (MethodNode method in ctx.GetByName(name => bothKindPrefixes.Any(name.StartsWith)))
+            foreach (
+                MethodNode method in ctx.GetByName(name => bothKindPrefixes.Any(name.StartsWith)))
                 method.Kind = AsyncMethodKind.Both;
 
             // Pass 2: Classify recursively.
@@ -500,10 +503,20 @@ namespace Buddy.Analyzers
                         return false;
 
                     if (RethrowsCoroutineStoppedException(catchClause, model))
+                    {
                         rethrows = true;
+                        return true;
+                    }
                 }
 
-                if (RethrowsAnything(catchClause))
+                ControlFlowAnalysis controlFlowResult =
+                    model.AnalyzeControlFlow(catchClause.Block);
+
+                // Check if this catch always rethrows
+                if (controlFlowResult.Succeeded &&
+                    !controlFlowResult.EndPointIsReachable &&
+                    controlFlowResult.ExitPoints.Length == 0 &&
+                    controlFlowResult.ReturnStatements.Length == 0)
                     rethrows = true;
 
                 return true;
@@ -535,60 +548,21 @@ namespace Buddy.Analyzers
                 if (clause.Block != null)
                 {
                     // Check pattern "if (ex is CoroutineStoppedException) throw;"
-                    foreach (StatementSyntax statement in clause.Block.Statements)
+                    IfStatementSyntax @if = clause.Block.Statements[0] as IfStatementSyntax;
+                    if (@if != null &&
+                        IsExIsCoroutineStoppedExceptionExp(@if.Condition, exceptionSymbol, model))
                     {
-                        IfStatementSyntax @if = statement as IfStatementSyntax;
-                        if (@if != null &&
-                            IsExIsCoroutineStoppedExceptionExp(@if.Condition, exceptionSymbol, model))
-                        {
-                            if (@if.Statement is ThrowStatementSyntax)
-                                return true;
+                        if (@if.Statement is ThrowStatementSyntax)
+                            return true;
 
-                            BlockSyntax block = @if.Statement as BlockSyntax;
-                            if (block != null && block.Statements.Count > 0 &&
-                                block.Statements[0] is ThrowStatementSyntax)
-                                return true;
-                        }
-
-                        if (CanThrow(statement))
-                            break;
+                        BlockSyntax block = @if.Statement as BlockSyntax;
+                        if (block != null && block.Statements.Count > 0 &&
+                            block.Statements[0] is ThrowStatementSyntax)
+                            return true;
                     }
                 }
 
                 return false;
-            }
-
-            private bool RethrowsAnything(CatchClauseSyntax catchClause)
-            {
-                if (catchClause.Block == null)
-                    return false;
-
-                foreach (StatementSyntax statement in catchClause.Block.Statements)
-                {
-                    ThrowStatementSyntax throwStatement = statement as ThrowStatementSyntax;
-                    if (throwStatement != null && throwStatement.Expression == null)
-                        return true;
-
-                    if (CanThrow(statement))
-                        break;
-                }
-
-                return false;
-            }
-
-            private bool CanThrow(StatementSyntax statement)
-            {
-                // Check for simple assignments for now.
-                ExpressionStatementSyntax expStatement = statement as ExpressionStatementSyntax;
-                AssignmentExpressionSyntax exp = expStatement?.Expression as AssignmentExpressionSyntax;
-                if (expStatement == null || exp == null)
-                    return true;
-
-                if (exp.Left is IdentifierNameSyntax &&
-                    (exp.Right is LiteralExpressionSyntax || exp.Right is IdentifierNameSyntax))
-                    return false;
-
-                return true;
             }
 
             private bool IsExIsCoroutineStoppedExceptionExp(ExpressionSyntax exp,
