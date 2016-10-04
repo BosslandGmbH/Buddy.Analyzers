@@ -88,13 +88,6 @@ namespace Buddy.Analyzers
         private static void AnalyzeCompilation(CompilationAnalysisContext context)
         {
             Compilation comp = context.Compilation;
-            List<MethodDeclarationSyntax> methods = comp.SyntaxTrees.SelectMany(
-                                                            st =>
-                                                                st.GetRoot()
-                                                                  .DescendantNodes()
-                                                                  .OfType
-                                                                  <MethodDeclarationSyntax>())
-                                                        .ToList();
 
             AnalyzeContext ctx = new AnalyzeContext
                                  {
@@ -116,94 +109,31 @@ namespace Buddy.Analyzers
                 ctx.CoroutineStoppedExceptionType == null)
                 return;
 
-            // Seed with declared async methods.
-            foreach (MethodDeclarationSyntax method in methods)
-            {
-                var semanticModel = comp.GetSemanticModel(method.SyntaxTree);
-                IMethodSymbol sym = semanticModel.GetDeclaredSymbol(method);
-                if (!ctx.IsAsyncCompatible(sym) ||
-                    method.Modifiers.All(st => st.Kind() != SyntaxKind.AsyncKeyword))
-                    continue;
-
-                ctx.AddOrGetNode(sym, method);
-            }
+            // Seed with declared task methods.
+            FindDeclaredTasks(ctx, comp);
 
             // Expand seed set to full call graph.
-            foreach (
-                KeyValuePair<IMethodSymbol, MethodNode> kvp in ctx.Methods.ToList())
-            {
-                SemanticModel model = comp.GetSemanticModel(kvp.Value.AsyncDeclaration.SyntaxTree);
-                if (kvp.Value.AsyncDeclaration.Body == null)
-                    continue;
+            GenerateCallGraph(ctx, comp);
 
-                List<InvocationExpressionSyntax> invocations =
-                    kvp.Value.AsyncDeclaration.Body.DescendantNodes(
-                           sn => !(sn is LambdaExpressionSyntax))
-                       .OfType<InvocationExpressionSyntax>().ToList();
-
-                foreach (InvocationExpressionSyntax invoc in invocations)
-                {
-                    IMethodSymbol calledSym = model.GetSymbolInfo(invoc).Symbol as IMethodSymbol;
-                    if (calledSym == null)
-                        continue;
-
-                    if (!ctx.IsAsyncCompatible(calledSym))
-                        continue;
-
-                    MethodNode called = ctx.AddOrGetNode(calledSym, null);
-
-                    bool isAwaited = IsAwaited(invoc);
-                    called.Callers.Add(new Call(kvp.Value, isAwaited));
-                    kvp.Value.Callees.Add(new Call(called, isAwaited));
-                }
-            }
-
-            // Mark commonly known coroutines and external tasks.
-            string[] bosslandPrefixes =
-            {
-                "Buddy.Coroutines.",
-                "Styx.CommonBot.Coroutines."
-            };
-
-            foreach (
-                MethodNode method in
-                ctx.MethodsByName.Where(kvp => bosslandPrefixes.Any(p => kvp.Key.StartsWith(p)))
-                   .SelectMany(kvp => kvp.Value))
-                ctx.Mark(method, AsyncMethodKind.Coroutine);
-
-            foreach (
-                MethodNode method in
-                ctx.MethodsByName.Where(kvp => kvp.Key.StartsWith("System."))
-                   .SelectMany(kvp => kvp.Value))
-                ctx.Mark(method, AsyncMethodKind.ExternalTask);
-
-            foreach (MethodNode method in 
-                ctx.MethodsByName.Where(kvp => kvp.Key.EndsWith("Coroutine"))
-                   .SelectMany(kvp => kvp.Value))
-                ctx.Mark(method, AsyncMethodKind.Coroutine);
-
-            foreach (MethodNode method in 
-                ctx.MethodsByName.Where(kvp => kvp.Key.EndsWith("Async"))
-                   .SelectMany(kvp => kvp.Value))
-                ctx.Mark(method, AsyncMethodKind.ExternalTask);
-
-            ctx.MarkSingle("System.Threading.Task.CompletedTask", AsyncMethodKind.Both);
-            ctx.MarkSingle("System.Threading.Task.FromResult", AsyncMethodKind.Both);
+            // Mark task methods as coroutines, external tasks or both.
+            ClassifyTasks(ctx);
 
             // Generate errors.
             foreach (
                 KeyValuePair<IMethodSymbol, MethodNode> kvp in
                 ctx.Methods.Where(
                        kvp =>
-                           kvp.Value.AsyncDeclaration != null &&
+                           kvp.Value.Declaration != null &&
+                           kvp.Value.IsAsync.HasValue &&
+                           kvp.Value.IsAsync.Value &&
                            (kvp.Value.Kind == AsyncMethodKind.Coroutine ||
                             kvp.Value.Kind == AsyncMethodKind.ExternalTask)))
             {
-                SyntaxTree tree = kvp.Value.AsyncDeclaration.SyntaxTree;
+                SyntaxTree tree = kvp.Value.Declaration.SyntaxTree;
                 SemanticModel model = comp.GetSemanticModel(tree);
 
                 IEnumerable<SyntaxNode> invocs =
-                    kvp.Value.AsyncDeclaration
+                    kvp.Value.Declaration
                        .DescendantNodes(sn => !(sn is LambdaExpressionSyntax))
                        .OfType<InvocationExpressionSyntax>();
 
@@ -260,7 +190,7 @@ namespace Buddy.Analyzers
                 if (callerIsCoroutine)
                 {
                     IEnumerable<TryStatementSyntax> tryStatements =
-                        kvp.Value.AsyncDeclaration
+                        kvp.Value.Declaration
                            .DescendantNodes(sn => !(sn is LambdaExpressionSyntax))
                            .OfType<TryStatementSyntax>();
 
@@ -271,41 +201,143 @@ namespace Buddy.Analyzers
                                         .DescendantNodes(sn => !(sn is LambdaExpressionSyntax))
                                         .Any(sn => sn is AwaitExpressionSyntax);
 
-                        if (tryContainsAwait)
+                        if (!tryContainsAwait)
+                            continue;
+
+                        // Check if it catches coroutine stopped exception...
+                        foreach (CatchClauseSyntax catchClause in tryStatement.Catches)
                         {
-                            foreach (CatchClauseSyntax catchClause in tryStatement.Catches)
+                            bool rethrows;
+                            if (!ctx.CatchClauseCatchesCoroutineStopped(
+                                catchClause, model, out rethrows))
+                                continue;
+
+                            if (!rethrows)
                             {
-                                if (ctx.CatchClauseCatchesCoroutineStopped(catchClause, model))
-                                {
-                                    context.ReportDiagnostic(
-                                        Diagnostic.Create(s_doNotCatchCoroutineStoppedExceptionRule,
-                                                          catchClause.GetLocation()));
-                                }
+                                context.ReportDiagnostic(
+                                    Diagnostic.Create(
+                                        s_doNotCatchCoroutineStoppedExceptionRule,
+                                        catchClause.GetLocation()));
                             }
 
-                            if (tryStatement.Finally != null)
-                            {
-                                IEnumerable<AwaitExpressionSyntax> awaits =
-                                    tryStatement.Finally.Block.DescendantNodes(
-                                                    sn => !(sn is LambdaExpressionSyntax))
-                                                .OfType<AwaitExpressionSyntax>();
+                            break;
+                        }
 
-                                foreach (AwaitExpressionSyntax @await in awaits)
-                                {
-                                    context.ReportDiagnostic(
-                                        Diagnostic.Create(s_doNotAwaitInsideFinallyRule,
-                                                          @await.GetLocation()));
-                                }
-                            }
+                        if (tryStatement.Finally == null)
+                            continue;
+
+                        // Check if it awaits inside finally
+                        IEnumerable<AwaitExpressionSyntax> awaits =
+                            tryStatement.Finally.Block.DescendantNodes(
+                                            sn => !(sn is LambdaExpressionSyntax))
+                                        .OfType<AwaitExpressionSyntax>();
+
+                        foreach (AwaitExpressionSyntax @await in awaits)
+                        {
+                            context.ReportDiagnostic(
+                                Diagnostic.Create(s_doNotAwaitInsideFinallyRule,
+                                                  @await.GetLocation()));
                         }
                     }
                 }
             }
         }
 
+        private static void FindDeclaredTasks(AnalyzeContext ctx, Compilation comp)
+        {
+            IEnumerable<MethodDeclarationSyntax> methods =
+                comp.SyntaxTrees.SelectMany(
+                        st => st.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>());
+
+            foreach (MethodDeclarationSyntax method in methods)
+            {
+                SemanticModel semanticModel = comp.GetSemanticModel(method.SyntaxTree);
+                IMethodSymbol sym = semanticModel.GetDeclaredSymbol(method);
+                if (method.Body == null ||
+                    !ctx.IsAsyncCompatible(sym))
+                    continue;
+
+                ctx.AddOrGetNode(sym, method);
+            }
+        }
+
+        private static void GenerateCallGraph(AnalyzeContext ctx, Compilation comp)
+        {
+            foreach (MethodNode method in ctx.Methods.Values.ToList())
+            {
+                SemanticModel model = comp.GetSemanticModel(method.Declaration.SyntaxTree);
+
+                IEnumerable<InvocationExpressionSyntax> invocations =
+                    method.Declaration.Body.DescendantNodes(
+                              sn => !(sn is LambdaExpressionSyntax))
+                          .OfType<InvocationExpressionSyntax>();
+
+                foreach (InvocationExpressionSyntax invoc in invocations)
+                {
+                    IMethodSymbol calledSym = model.GetSymbolInfo(invoc).Symbol as IMethodSymbol;
+                    if (calledSym == null)
+                        continue;
+
+                    if (!ctx.IsAsyncCompatible(calledSym))
+                        continue;
+
+                    MethodNode called = ctx.AddOrGetNode(calledSym, null);
+
+                    bool isAwaited = IsAwaited(invoc);
+                    bool isReturned = IsReturned(invoc);
+                    called.Callers.Add(new Call(method, isAwaited, isReturned));
+                    method.Callees.Add(new Call(called, isAwaited, isReturned));
+                }
+            }
+        }
+
+        private static void ClassifyTasks(AnalyzeContext ctx)
+        {
+            // Pass 1: Mark our assumptions.
+            string[] bosslandPrefixes =
+            {
+                "Buddy.Coroutines.",
+                "Styx.CommonBot.Coroutines."
+            };
+
+            foreach (
+                MethodNode method in ctx.GetByName(name => bosslandPrefixes.Any(name.StartsWith)))
+            {
+                method.Kind = AsyncMethodKind.Coroutine;
+            }
+
+            foreach (MethodNode method in ctx.GetByName(name => name.EndsWith("Coroutine")))
+                method.Kind = AsyncMethodKind.Coroutine;
+
+            foreach (MethodNode method in ctx.GetByName(name => name.StartsWith("System.")))
+                method.Kind = AsyncMethodKind.ExternalTask;
+
+            foreach (MethodNode method in ctx.GetByName(name => name.EndsWith("Async")))
+                method.Kind = AsyncMethodKind.ExternalTask;
+
+            string[] bothKindPrefixes =
+            {
+                "System.Threading.Tasks.Task.CompletedTask",
+                "System.Threading.Tasks.Task.FromResult",
+                "System.Func"
+            };
+
+            foreach (MethodNode method in ctx.GetByName(name => bothKindPrefixes.Any(name.StartsWith)))
+                method.Kind = AsyncMethodKind.Both;
+
+            // Pass 2: Classify recursively.
+            ctx.FloodClassify(AsyncMethodKind.Coroutine);
+            ctx.FloodClassify(AsyncMethodKind.ExternalTask);
+        }
+
         private static bool IsAwaited(SyntaxNode node)
         {
             return node.Parent is AwaitExpressionSyntax;
+        }
+
+        private static bool IsReturned(SyntaxNode node)
+        {
+            return node.Parent is ReturnStatementSyntax;
         }
 
         private static string GetFullMethodName(IMethodSymbol symbol)
@@ -378,35 +410,61 @@ namespace Buddy.Analyzers
                 return node;
             }
 
-            // Marks a node and all its awaited/awaiting ancestors/descendants as the specified kind.
-            public void Mark(MethodNode node, AsyncMethodKind kind)
+            public IEnumerable<MethodNode> GetByName(Func<string, bool> matches)
             {
-                node.Kind = kind;
+                return MethodsByName.Where(kvp => matches(kvp.Key)).SelectMany(kvp => kvp.Value);
+            }
 
+            /// <summary>
+            /// Recursively classifies all parents/children of asyncs of the specified
+            /// kind.
+            /// </summary>
+            /// <param name="kind"></param>
+            public void FloodClassify(AsyncMethodKind kind)
+            {
+                foreach (MethodNode method in Methods.Values)
+                {
+                    if (method.Kind == kind)
+                        ClassifyRecursively(method);
+                }
+            }
+
+            private void ClassifyRecursively(MethodNode node)
+            {
+                // For coroutines we have a special case. When a coroutine uses
+                // a task without awaiting it, we cannot mark it as a coroutine,
+                // as it could be external.
                 foreach (Call parentCall in node.Callers)
                 {
-                    // Only mark coroutines if awaited
-                    if (parentCall.Other.Kind == AsyncMethodKind.Unknown &&
-                        (kind != AsyncMethodKind.Coroutine || parentCall.IsAwaited))
-                        Mark(parentCall.Other, kind);
+                    if (parentCall.Other.Kind != AsyncMethodKind.Unknown)
+                        continue;
+
+                    // Parent of external task is only an external task if awaited
+                    // or returned, since a coroutine can use an external task.
+                    if (node.Kind == AsyncMethodKind.ExternalTask &&
+                        !parentCall.IsAwaited &&
+                        !parentCall.IsReturned)
+                        continue;
+
+                    parentCall.Other.Kind = node.Kind;
+                    ClassifyRecursively(parentCall.Other);
                 }
 
                 foreach (Call childCall in node.Callees)
                 {
-                    if (childCall.Other.Kind == AsyncMethodKind.Unknown &&
-                        (kind != AsyncMethodKind.Coroutine || childCall.IsAwaited))
-                        Mark(childCall.Other, kind);
+                    if (childCall.Other.Kind != AsyncMethodKind.Unknown)
+                        continue;
+
+                    // Child of coroutine is only coroutine if it is awaited/returned
+                    // - otherwise it could be an external task.
+                    if (node.Kind == AsyncMethodKind.Coroutine &&
+                        !childCall.IsAwaited &&
+                        !childCall.IsReturned)
+                        continue;
+
+                    childCall.Other.Kind = node.Kind;
+                    ClassifyRecursively(childCall.Other);
                 }
-            }
-
-            public void MarkSingle(string name, AsyncMethodKind kind)
-            {
-                List<MethodNode> list;
-                if (!MethodsByName.TryGetValue(name, out list))
-                    return;
-
-                foreach (MethodNode node in list)
-                    node.Kind = kind;
             }
 
             public bool IsAsyncCompatible(IMethodSymbol symbol)
@@ -425,8 +483,9 @@ namespace Buddy.Analyzers
             }
 
             public bool CatchClauseCatchesCoroutineStopped(CatchClauseSyntax catchClause,
-                                                           SemanticModel model)
+                                                           SemanticModel model, out bool rethrows)
             {
+                rethrows = false;
                 if (catchClause.Declaration != null)
                 {
                     INamedTypeSymbol exceptionSymbol =
@@ -441,19 +500,11 @@ namespace Buddy.Analyzers
                         return false;
 
                     if (RethrowsCoroutineStoppedException(catchClause, model))
-                        return false;
+                        rethrows = true;
                 }
 
-                ControlFlowAnalysis controlFlowResult =
-                    model.AnalyzeControlFlow(catchClause.Block);
-                if (!controlFlowResult.Succeeded)
-                    return false;
-
-                // Check if this catch always rethrows
-                if (!controlFlowResult.EndPointIsReachable &&
-                    controlFlowResult.ExitPoints.Length == 0 &&
-                    controlFlowResult.ReturnStatements.Length == 0)
-                    return false;
+                if (RethrowsAnything(catchClause))
+                    rethrows = true;
 
                 return true;
             }
@@ -481,25 +532,63 @@ namespace Buddy.Analyzers
                     }
                 }
 
-                if (clause.Block != null &&
-                    clause.Block.Statements.Count > 0)
+                if (clause.Block != null)
                 {
                     // Check pattern "if (ex is CoroutineStoppedException) throw;"
-                    IfStatementSyntax @if = clause.Block.Statements[0] as IfStatementSyntax;
-                    if (@if != null &&
-                        IsExIsCoroutineStoppedExceptionExp(@if.Condition, exceptionSymbol, model))
+                    foreach (StatementSyntax statement in clause.Block.Statements)
                     {
-                        if (@if.Statement is ThrowStatementSyntax)
-                            return true;
+                        IfStatementSyntax @if = statement as IfStatementSyntax;
+                        if (@if != null &&
+                            IsExIsCoroutineStoppedExceptionExp(@if.Condition, exceptionSymbol, model))
+                        {
+                            if (@if.Statement is ThrowStatementSyntax)
+                                return true;
 
-                        BlockSyntax block = @if.Statement as BlockSyntax;
-                        if (block != null && block.Statements.Count > 0 &&
-                            block.Statements[0] is ThrowStatementSyntax)
-                            return true;
+                            BlockSyntax block = @if.Statement as BlockSyntax;
+                            if (block != null && block.Statements.Count > 0 &&
+                                block.Statements[0] is ThrowStatementSyntax)
+                                return true;
+                        }
+
+                        if (CanThrow(statement))
+                            break;
                     }
                 }
 
                 return false;
+            }
+
+            private bool RethrowsAnything(CatchClauseSyntax catchClause)
+            {
+                if (catchClause.Block == null)
+                    return false;
+
+                foreach (StatementSyntax statement in catchClause.Block.Statements)
+                {
+                    ThrowStatementSyntax throwStatement = statement as ThrowStatementSyntax;
+                    if (throwStatement != null && throwStatement.Expression == null)
+                        return true;
+
+                    if (CanThrow(statement))
+                        break;
+                }
+
+                return false;
+            }
+
+            private bool CanThrow(StatementSyntax statement)
+            {
+                // Check for simple assignments for now.
+                ExpressionStatementSyntax expStatement = statement as ExpressionStatementSyntax;
+                AssignmentExpressionSyntax exp = expStatement?.Expression as AssignmentExpressionSyntax;
+                if (expStatement == null || exp == null)
+                    return true;
+
+                if (exp.Left is IdentifierNameSyntax &&
+                    (exp.Right is LiteralExpressionSyntax || exp.Right is IdentifierNameSyntax))
+                    return false;
+
+                return true;
             }
 
             private bool IsExIsCoroutineStoppedExceptionExp(ExpressionSyntax exp,
@@ -523,17 +612,23 @@ namespace Buddy.Analyzers
 
         private class MethodNode
         {
-            public MethodNode(IMethodSymbol method, MethodDeclarationSyntax asyncDeclaration)
+            public MethodNode(IMethodSymbol method, MethodDeclarationSyntax declaration)
             {
                 Method = method;
-                AsyncDeclaration = asyncDeclaration;
+                Declaration = declaration;
+                if (declaration != null)
+                {
+                    IsAsync =
+                        declaration.Modifiers.Any(m => m.Kind() == SyntaxKind.AsyncKeyword);
+                }
             }
 
             public IMethodSymbol Method { get; }
             public HashSet<Call> Callers { get; } = new HashSet<Call>();
             public HashSet<Call> Callees { get; } = new HashSet<Call>();
             public AsyncMethodKind Kind { get; set; } = AsyncMethodKind.Unknown;
-            public MethodDeclarationSyntax AsyncDeclaration { get; }
+            public MethodDeclarationSyntax Declaration { get; }
+            public bool? IsAsync { get; }
 
             protected bool Equals(MethodNode other)
             {
@@ -569,14 +664,16 @@ namespace Buddy.Analyzers
 
         private struct Call
         {
-            public Call(MethodNode other, bool isAwaited)
+            public Call(MethodNode other, bool isAwaited, bool isReturned)
             {
                 Other = other;
                 IsAwaited = isAwaited;
+                IsReturned = isReturned;
             }
 
             public MethodNode Other { get; }
             public bool IsAwaited { get; }
+            public bool IsReturned { get; }
 
             public bool Equals(Call other)
             {
